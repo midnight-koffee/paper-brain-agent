@@ -1,0 +1,5 @@
+Title: Font Styles and Perceptual Space Reaction Times
+Abstract: In this study, we analyzed how different font styles impact human cognitive load. 
+We measured reaction times across 50 subjects. The primary conclusion is that highly 
+ornate fonts increase reaction time by 120 milliseconds compared to standard sans-serif fonts, 
+suggesting a higher cognitive friction in perceptual space.
