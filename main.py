@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import streamlit as st
 from dotenv import load_dotenv
 from google import genai
@@ -14,7 +15,6 @@ load_dotenv()
 fitz.TOOLS.mupdf_display_errors(False)
 st.set_page_config(page_title="Paper Brain", page_icon="🧠", layout="wide")
 
-# Initialize the Cookie Controller for persistence
 controller = CookieController()
 
 # --- 1. Database & Session Initialization ---
@@ -30,17 +30,17 @@ if "supabase" not in st.session_state:
 
 supabase = st.session_state.supabase
 
-# --- FIX: The Ghost Login & Session Patch ---
+# --- FIX 3: Robust Cookie Catching ---
+# Wait a fraction of a second for the JS component to mount and read the browser cookie
+time.sleep(0.15) 
 stored_token = controller.get("supabase_token")
+
 if stored_token and "user" not in st.session_state:
     try:
-        # 1. Recover user info
+        supabase.auth.set_session(stored_token, stored_token)
         res = supabase.auth.get_user(stored_token)
         st.session_state.user = res.user
-        # 2. CRITICAL: Set the session on the client so RLS allows DB access
-        supabase.auth.set_session(stored_token, stored_token)
     except Exception:
-        # If token is invalid/expired, wipe it
         try:
             controller.remove("supabase_token")
         except KeyError:
@@ -64,7 +64,7 @@ if "current_thread_id" not in st.session_state:
 
 # --- AI Memory Sync Helper ---
 def init_gemini():
-    """Syncs current messages to Gemini's history & allows chat without docs."""
+    """Syncs current messages to Gemini's history & context."""
     system_instruction = "You are 'Paper Brain', an expert research assistant."
     
     if st.session_state.doc_context:
@@ -73,7 +73,6 @@ def init_gemini():
             f"VAULT CONTENTS:\n{st.session_state.doc_context}"
         )
 
-    # Convert Streamlit messages to Gemini history format
     gemini_history = []
     for m in st.session_state.messages:
         if not m.get("is_status"): 
@@ -93,6 +92,10 @@ def reset_ui_state():
     st.session_state.processed_files = []
     st.session_state.docs_loaded = False
     st.session_state.current_thread_id = None
+
+def format_chat_title(raw_text):
+    clean_text = raw_text.replace('.pdf', '').replace('.txt', '').replace('_', ' ').strip()
+    return (clean_text[:25] + '...') if len(clean_text) > 25 else clean_text
 
 # --- 🚨 THE BOUNCER (LOGIN SCREEN) 🚨 ---
 if not st.session_state.get("user"):
@@ -124,33 +127,17 @@ if not st.session_state.get("user"):
                 st.error(f"Signup Error: {str(e)}")
     st.stop()
 
-# --- 2. Load Vault Data on Login ---
+# --- FIX 1: Blank Slate on Login ---
+# We no longer auto-load the last chat. We just boot up an empty workspace.
 if st.session_state.user and not st.session_state.docs_loaded:
-    with st.spinner("Unlocking your vault..."):
-        try:
-            response = supabase.table("documents").select("*").eq("user_id", st.session_state.user.id).execute()
-            if response.data:
-                combined_text = ""
-                file_names = []
-                for doc in response.data:
-                    file_names.append(doc["file_name"])
-                    combined_text += f"\n--- START OF DOCUMENT: {doc['file_name']} ---\n{doc['summary']}\n--- END OF DOCUMENT ---\n"
-                
-                st.session_state.doc_context = combined_text
-                st.session_state.processed_files = file_names
-            
-            # Initialize the AI session (with or without docs)
-            st.session_state.chat_session = init_gemini()
-        except Exception as e:
-            st.error(f"Error loading vault: {e}")
-            
+    st.session_state.chat_session = init_gemini()
     st.session_state.docs_loaded = True
 
-# --- 3. Sidebar: ChatGPT UI & Vault ---
+# --- 3. Sidebar: Sleek ChatGPT UI ---
 with st.sidebar:
     if st.button("➕ New Chat", use_container_width=True, type="primary"):
-        st.session_state.current_thread_id = None
-        st.session_state.messages = []
+        reset_ui_state()
+        st.session_state.docs_loaded = True 
         st.session_state.chat_session = init_gemini()
         st.rerun()
         
@@ -161,10 +148,23 @@ with st.sidebar:
         threads = supabase.table("chat_threads").select("*").eq("user_id", st.session_state.user.id).order("created_at", desc=True).execute().data
         if threads:
             for t in threads:
-                if st.button(t['title'], key=f"thread_{t['id']}", use_container_width=True):
+                btn_type = "secondary" if t['id'] == st.session_state.current_thread_id else "tertiary"
+                if st.button(t['title'], key=f"thread_{t['id']}", use_container_width=True, type=btn_type):
                     st.session_state.current_thread_id = t['id']
+                    
                     msgs = supabase.table("chat_messages").select("*").eq("thread_id", t['id']).order("created_at", desc=False).execute().data
                     st.session_state.messages = [{"role": m["role"], "content": m["content"], "is_status": False} for m in msgs]
+                    
+                    docs = supabase.table("documents").select("*").eq("thread_id", t['id']).execute().data
+                    combined_text = ""
+                    file_names = []
+                    if docs:
+                        for doc in docs:
+                            file_names.append(doc["file_name"])
+                            combined_text += f"\n--- START OF DOCUMENT: {doc['file_name']} ---\n{doc['summary']}\n--- END OF DOCUMENT ---\n"
+                    
+                    st.session_state.doc_context = combined_text
+                    st.session_state.processed_files = file_names
                     st.session_state.chat_session = init_gemini()
                     st.rerun()
         else:
@@ -174,65 +174,15 @@ with st.sidebar:
         
     st.divider()
     
-    st.markdown("### 📄 Document Vault")
+    st.markdown("### 📄 Attached Papers")
     if st.session_state.processed_files:
         for f in st.session_state.processed_files:
             st.caption(f"✅ {f}")
     else:
-        st.caption("Your vault is empty.")
+        st.caption("No papers attached to this chat.")
         
-    uploaded_files = st.file_uploader("Upload new PDFs", type=["pdf", "txt"], accept_multiple_files=True)
-    
-    if uploaded_files:
-        if st.button("Process & Save Uploads"):
-            with st.spinner("Extracting text..."):
-                new_text_added = ""
-                error_occurred = False
-                
-                for file in uploaded_files:
-                    if file.name not in st.session_state.processed_files:
-                        text = ""
-                        if file.name.lower().endswith('.pdf'):
-                            try:
-                                doc = fitz.open(stream=file.read(), filetype="pdf")
-                                for page in doc:
-                                    # FIX: Robust Regex Cleaner for Null Bytes and Control Chars
-                                    raw_text = page.get_text()
-                                    clean_text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', raw_text)
-                                    text += clean_text + "\n"
-                            except Exception as e:
-                                st.error(f"Error reading {file.name}: {str(e)}")
-                                error_occurred = True
-                                continue
-                        else:
-                            raw_data = file.read().decode('utf-8', errors='ignore')
-                            text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', raw_data)
-                            
-                        try:
-                            supabase.table("documents").insert({
-                                "user_id": st.session_state.user.id,
-                                "file_name": file.name,
-                                "summary": text
-                            }).execute()
-                            
-                            st.session_state.processed_files.append(file.name)
-                            new_text_added += f"\n--- START OF DOCUMENT: {file.name} ---\n{text}\n--- END OF DOCUMENT ---\n"
-                        except Exception as e:
-                            st.error(f"Database Error for {file.name}: {e}")
-                            error_occurred = True
-                
-                if not error_occurred and new_text_added:
-                    st.session_state.doc_context += new_text_added
-                    st.session_state.chat_session = init_gemini()
-                    st.session_state.messages.append({
-                        "role": "assistant", 
-                        "content": "Documents added to vault. Context updated.",
-                        "is_status": True 
-                    })
-                    st.rerun()
-
     st.divider()
-    # FIX: Safe Logout
+    
     if st.button("🚪 Logout", use_container_width=True):
         try:
             controller.remove("supabase_token")
@@ -246,10 +196,27 @@ with st.sidebar:
 st.title("🧠 Paper Brain Agent")
 
 if st.session_state.processed_files:
-    cols = st.columns(len(st.session_state.processed_files))
+    st.markdown("### 🛠️ Researcher's Toolkit")
+    
     for i, file_name in enumerate(st.session_state.processed_files):
-        if cols[i].button(f"Summarize {file_name[:20]}...", key=f"sum_btn_{i}"):
-            st.session_state.trigger_summary = file_name
+        st.caption(f"**Target:** {file_name}")
+        col1, col2, col3, _ = st.columns([0.2, 0.2, 0.2, 0.4])
+        
+        if col1.button("📑 Summarize", key=f"sum_{i}", use_container_width=True):
+            st.session_state.trigger_action = {"file": file_name, "type": "summary"}
+        if col2.button("📖 Glossary", key=f"glos_{i}", use_container_width=True):
+            st.session_state.trigger_action = {"file": file_name, "type": "glossary"}
+        if col3.button("⚖️ Critique", key=f"crit_{i}", use_container_width=True):
+            st.session_state.trigger_action = {"file": file_name, "type": "critique"}
+            
+    if len(st.session_state.processed_files) > 1:
+        st.markdown("#### 🔗 Multi-Paper Synthesis")
+        if st.button("📊 Compare Attached Papers", use_container_width=True, type="primary"):
+            st.session_state.trigger_action = {
+                "file": ", ".join(st.session_state.processed_files), 
+                "type": "compare"
+            }
+            
     st.divider()
 
 # Display chat history
@@ -263,21 +230,65 @@ for i, msg in enumerate(st.session_state.messages):
             with btn_col2:
                 with st.popover("📋"):
                     st.code(msg["content"], language="markdown")
+                    
+    # --- FIX 2: The Regenerate Button for Orphaned User Messages ---
+    # If this is the last message in the list AND it's from the user, the AI got interrupted.
+    if i == len(st.session_state.messages) - 1 and msg["role"] == "user":
+        if st.button("🔄 Regenerate Response", key="regen_btn"):
+            st.session_state.trigger_action = {"file": None, "type": "regenerate", "query": msg["content"]}
+            st.rerun()
 
-# --- 5. Logic Router: Summaries ---
-if "trigger_summary" in st.session_state:
-    target_file = st.session_state.trigger_summary
-    del st.session_state.trigger_summary 
+# --- 5. Logic Router: Automated Tools & Regeneration ---
+if "trigger_action" in st.session_state:
+    target_file = st.session_state.trigger_action.get("file")
+    action_type = st.session_state.trigger_action["type"]
+    user_msg = ""
+    prompt = ""
     
-    prompt = f"Summarize '{target_file}' using First-Principles logic. Define technical terms inline."
-    
-    if not st.session_state.current_thread_id:
-        title = f"Summary: {target_file}"[:50]
-        res = supabase.table("chat_threads").insert({"user_id": st.session_state.user.id, "title": title}).execute()
-        st.session_state.current_thread_id = res.data[0]["id"]
+    if action_type == "summary":
+        user_msg = f"Summarize `{target_file}`"
+        prompt = f"Summarize '{target_file}' using First-Principles logic. Define technical terms inline. Break down the core methodology."
+    elif action_type == "glossary":
+        user_msg = f"Generate a glossary for `{target_file}`"
+        prompt = f"Extract the top 10-15 most complex technical terms, acronyms, and mathematical variables used in '{target_file}'. Output them as a highly readable Markdown dictionary with simple, first-principles definitions."
+    elif action_type == "critique":
+        user_msg = f"Critique `{target_file}`"
+        prompt = f"Act as a peer reviewer for '{target_file}'. Identify the core assumptions, potential biases, methodological limitations, and what future research would be needed to prove or disprove the claims."
+    elif action_type == "compare":
+        user_msg = f"Compare the attached papers: {target_file}"
+        prompt = f"""You are analyzing the following attached papers: {target_file}.
+
+STEP 1: THE DOMAIN CHECK
+First, rigorously evaluate if these papers belong to the same general research domain. 
+If they are fundamentally unrelated, STATE THIS CLEARLY. Briefly explain what each focuses on and why comparing their methodology is invalid.
+
+STEP 2: THE COMPARISON MATRIX
+If they are related, synthesize them into a side-by-side Markdown comparison table.
+Rule 1: Use First-Principles logic. No unexplained jargon.
+Rule 2: Be highly concise.
+
+The table MUST include these exact rows:
+- The "Big Idea" (Core Hypothesis)
+- The Methodology (How did they test it?)
+- Data & Scale (What did they measure?)
+- The Catch (Assumptions & Limitations)
+
+After the table, conclude which paper has stronger evidence or how they complement each other."""
+    elif action_type == "regenerate":
+        # We don't save a new user message, we just feed the old query back to the prompt
+        prompt = st.session_state.trigger_action["query"]
         
-    st.session_state.messages.append({"role": "user", "content": f"Summarize `{target_file}`"})
-    supabase.table("chat_messages").insert({"thread_id": st.session_state.current_thread_id, "role": "user", "content": f"Summarize `{target_file}`"}).execute()
+    del st.session_state.trigger_action 
+    
+    # Only create a thread/save user message if it's NOT a regeneration
+    if action_type != "regenerate":
+        if not st.session_state.current_thread_id:
+            title = format_chat_title(f"{action_type.capitalize()}: {target_file}")
+            res = supabase.table("chat_threads").insert({"user_id": st.session_state.user.id, "title": title}).execute()
+            st.session_state.current_thread_id = res.data[0]["id"]
+            
+        st.session_state.messages.append({"role": "user", "content": user_msg})
+        supabase.table("chat_messages").insert({"thread_id": st.session_state.current_thread_id, "role": "user", "content": user_msg}).execute()
     
     with st.chat_message("assistant"):
         response_stream = st.session_state.chat_session.send_message_stream(prompt)
@@ -287,20 +298,86 @@ if "trigger_summary" in st.session_state:
     st.session_state.messages.append({"role": "assistant", "content": full_response, "is_status": False})
     st.rerun()
 
-# --- 6. Chat Input & Persistent Storage ---
-if user_input := st.chat_input("Ask about the documents..."):
+# --- 6. Chat Input & Persistent Storage (The Magic Box) ---
+if user_input := st.chat_input("Ask about papers or attach new ones...", accept_file="multiple", file_type=["pdf", "txt"]):
+    
+    text_query = getattr(user_input, 'text', user_input if isinstance(user_input, str) else "")
+    uploaded_files = getattr(user_input, 'files', [])
+
     if not st.session_state.current_thread_id:
-        title = user_input[:40] + "..." if len(user_input) > 40 else user_input
+        raw_title = text_query if text_query else (uploaded_files[0].name if uploaded_files else "New Research Chat")
+        title = format_chat_title(raw_title)
         res = supabase.table("chat_threads").insert({"user_id": st.session_state.user.id, "title": title}).execute()
         st.session_state.current_thread_id = res.data[0]["id"]
 
-    supabase.table("chat_messages").insert({"thread_id": st.session_state.current_thread_id, "role": "user", "content": user_input}).execute()
-    st.session_state.messages.append({"role": "user", "content": user_input})
-    
-    with st.chat_message("assistant"):
-        response_stream = st.session_state.chat_session.send_message_stream(user_input)
-        full_response = st.write_stream((chunk.text for chunk in response_stream))
+    new_text_added = ""
+    error_occurred = False
+
+    # 1. Process any attached files first
+    if uploaded_files:
+        with st.spinner("Extracting and attaching documents..."):
+            for file in uploaded_files:
+                if file.name not in st.session_state.processed_files:
+                    text = ""
+                    if file.name.lower().endswith('.pdf'):
+                        try:
+                            doc = fitz.open(stream=file.read(), filetype="pdf")
+                            for page in doc:
+                                raw_text = page.get_text()
+                                text += re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', raw_text) + "\n"
+                                
+                            if len(text.strip()) < 50:
+                                st.warning(f"⚠️ '{file.name}' appears to be a scanned image or presentation. Paper Brain currently requires text-based PDFs.")
+                                error_occurred = True
+                                continue 
+                                
+                        except Exception as e:
+                            st.error(f"Error reading {file.name}: {str(e)}")
+                            error_occurred = True
+                            continue
+                    else:
+                        raw_data = file.read().decode('utf-8', errors='ignore')
+                        text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', raw_data)
+
+                    try:
+                        supabase.table("documents").insert({
+                            "user_id": st.session_state.user.id,
+                            "thread_id": st.session_state.current_thread_id,
+                            "file_name": file.name,
+                            "summary": text
+                        }).execute()
+                        
+                        st.session_state.processed_files.append(file.name)
+                        new_text_added += f"\n--- START OF DOCUMENT: {file.name} ---\n{text}\n--- END OF DOCUMENT ---\n"
+                    except Exception as e:
+                        st.error(f"Database Error: {e}")
+                        error_occurred = True
+            
+            if new_text_added and not error_occurred:
+                st.session_state.doc_context += new_text_added
+                st.session_state.chat_session = init_gemini()
+                
+                if not text_query:
+                    st.session_state.messages.append({
+                        "role": "assistant", 
+                        "content": f"✅ Successfully attached {len(uploaded_files)} document(s). You can ask a specific question, or use the **Researcher's Toolkit** buttons above to get started.",
+                        "is_status": True 
+                    })
+
+    # 2. Process Text Query (if they typed one)
+    if text_query:
+        supabase.table("chat_messages").insert({"thread_id": st.session_state.current_thread_id, "role": "user", "content": text_query}).execute()
+        st.session_state.messages.append({"role": "user", "content": text_query})
         
-    supabase.table("chat_messages").insert({"thread_id": st.session_state.current_thread_id, "role": "assistant", "content": full_response}).execute()
-    st.session_state.messages.append({"role": "assistant", "content": full_response, "is_status": False})
+        # User message instant render
+        with st.chat_message("user"):
+            st.markdown(text_query)
+            
+        with st.chat_message("assistant"):
+            response_stream = st.session_state.chat_session.send_message_stream(text_query)
+            full_response = st.write_stream((chunk.text for chunk in response_stream))
+            
+        supabase.table("chat_messages").insert({"thread_id": st.session_state.current_thread_id, "role": "assistant", "content": full_response}).execute()
+        st.session_state.messages.append({"role": "assistant", "content": full_response, "is_status": False})
+        
     st.rerun()
