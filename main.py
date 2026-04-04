@@ -30,8 +30,7 @@ if "supabase" not in st.session_state:
 
 supabase = st.session_state.supabase
 
-# --- FIX 3: Robust Cookie Catching ---
-# Wait a fraction of a second for the JS component to mount and read the browser cookie
+# --- Robust Cookie Catching ---
 time.sleep(0.15) 
 stored_token = controller.get("supabase_token")
 
@@ -65,12 +64,18 @@ if "current_thread_id" not in st.session_state:
 # --- AI Memory Sync Helper ---
 def init_gemini():
     """Syncs current messages to Gemini's history & context."""
-    system_instruction = "You are 'Paper Brain', an expert research assistant."
+    
+    # SHIVAM'S FIX: The Ironclad Guardrail Prompt
+    system_instruction = (
+        "You are 'Paper Brain', an elite academic research assistant. "
+        "YOUR STRICT DIRECTIVE: You must ONLY answer questions related to academic research, science, methodology, literature reviews, and the uploaded documents. "
+        "If the user asks for recipes, movie reviews, coding help (unless it is data-science related to a paper), or general chit-chat, you must firmly refuse. State that you are a dedicated research assistant and ask them to provide a paper. "
+        "Always rely strictly on the provided text. Use strict LaTeX: $x$ for inline, $$x$$ for blocks."
+    )
     
     if st.session_state.doc_context:
         system_instruction += (
-            f"\n\nAlways rely strictly on the provided text. Use strict LaTeX: $x$ for inline, $$x$$ for blocks.\n\n"
-            f"VAULT CONTENTS:\n{st.session_state.doc_context}"
+            f"\n\nVAULT CONTENTS:\n{st.session_state.doc_context}"
         )
 
     gemini_history = []
@@ -81,7 +86,10 @@ def init_gemini():
             
     return st.session_state.client.chats.create(
         model="gemini-2.5-flash",
-        config=types.GenerateContentConfig(system_instruction=system_instruction),
+        config=types.GenerateContentConfig(
+            system_instruction=system_instruction,
+            temperature=0.1  # SHIVAM'S FIX: Drops creativity to near-zero for factual rigor
+        ),
         history=gemini_history
     )
 
@@ -105,30 +113,35 @@ if not st.session_state.get("user"):
     tab1, tab2 = st.tabs(["Login", "Sign Up"])
     
     with tab1:
-        log_email = st.text_input("Email", key="log_email")
-        log_password = st.text_input("Password", type="password", key="log_pass")
-        if st.button("Login"):
-            try:
-                response = supabase.auth.sign_in_with_password({"email": log_email, "password": log_password})
-                st.session_state.user = response.user
-                controller.set("supabase_token", response.session.access_token)
-                st.rerun()
-            except Exception as e:
-                st.error(f"Login Failed: {str(e)}")
+        with st.form("login_form"):
+            log_email = st.text_input("Email", key="log_email")
+            log_password = st.text_input("Password", type="password", key="log_pass")
+            submit_login = st.form_submit_button("Login")
+            
+            if submit_login:
+                try:
+                    response = supabase.auth.sign_in_with_password({"email": log_email, "password": log_password})
+                    st.session_state.user = response.user
+                    controller.set("supabase_token", response.session.access_token)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Login Failed: {str(e)}")
                 
     with tab2:
-        reg_email = st.text_input("Email", key="reg_email")
-        reg_password = st.text_input("Password", type="password", key="reg_pass")
-        if st.button("Create Account"):
-            try:
-                supabase.auth.sign_up({"email": reg_email, "password": reg_password})
-                st.success("✅ Account created! Check your email inbox for a confirmation link.")
-            except Exception as e:
-                st.error(f"Signup Error: {str(e)}")
+        with st.form("signup_form"):
+            reg_email = st.text_input("Email", key="reg_email")
+            reg_password = st.text_input("Password", type="password", key="reg_pass")
+            submit_signup = st.form_submit_button("Create Account")
+            
+            if submit_signup:
+                try:
+                    supabase.auth.sign_up({"email": reg_email, "password": reg_password})
+                    st.success("✅ Account created! Check your email for verification, or log in if email verification is turned off.")
+                except Exception as e:
+                    st.error(f"Signup Error: {str(e)}")
     st.stop()
 
-# --- FIX 1: Blank Slate on Login ---
-# We no longer auto-load the last chat. We just boot up an empty workspace.
+# --- Blank Slate on Login ---
 if st.session_state.user and not st.session_state.docs_loaded:
     st.session_state.chat_session = init_gemini()
     st.session_state.docs_loaded = True
@@ -231,8 +244,7 @@ for i, msg in enumerate(st.session_state.messages):
                 with st.popover("📋"):
                     st.code(msg["content"], language="markdown")
                     
-    # --- FIX 2: The Regenerate Button for Orphaned User Messages ---
-    # If this is the last message in the list AND it's from the user, the AI got interrupted.
+    # The Regenerate Button for Orphaned User Messages
     if i == len(st.session_state.messages) - 1 and msg["role"] == "user":
         if st.button("🔄 Regenerate Response", key="regen_btn"):
             st.session_state.trigger_action = {"file": None, "type": "regenerate", "query": msg["content"]}
@@ -275,12 +287,10 @@ The table MUST include these exact rows:
 
 After the table, conclude which paper has stronger evidence or how they complement each other."""
     elif action_type == "regenerate":
-        # We don't save a new user message, we just feed the old query back to the prompt
         prompt = st.session_state.trigger_action["query"]
         
     del st.session_state.trigger_action 
     
-    # Only create a thread/save user message if it's NOT a regeneration
     if action_type != "regenerate":
         if not st.session_state.current_thread_id:
             title = format_chat_title(f"{action_type.capitalize()}: {target_file}")
@@ -313,7 +323,6 @@ if user_input := st.chat_input("Ask about papers or attach new ones...", accept_
     new_text_added = ""
     error_occurred = False
 
-    # 1. Process any attached files first
     if uploaded_files:
         with st.spinner("Extracting and attaching documents..."):
             for file in uploaded_files:
@@ -364,12 +373,10 @@ if user_input := st.chat_input("Ask about papers or attach new ones...", accept_
                         "is_status": True 
                     })
 
-    # 2. Process Text Query (if they typed one)
     if text_query:
         supabase.table("chat_messages").insert({"thread_id": st.session_state.current_thread_id, "role": "user", "content": text_query}).execute()
         st.session_state.messages.append({"role": "user", "content": text_query})
         
-        # User message instant render
         with st.chat_message("user"):
             st.markdown(text_query)
             
